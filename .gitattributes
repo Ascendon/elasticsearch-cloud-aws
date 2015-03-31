@@ -1,0 +1,3 @@
+# Normalize all text files to use LF when committed to the repo
+# The developer's core.eol configuration setting will drive if their working copy uses CRLF or LF
+* text=auto
