@@ -19,6 +19,8 @@
 
 package org.elasticsearch.repositories.s3;
 
+import com.amazonaws.services.s3.model.EncryptionMaterials;
+import com.amazonaws.util.Base64;
 import org.elasticsearch.cloud.aws.AwsS3Service;
 import org.elasticsearch.cloud.aws.blobstore.S3BlobStore;
 import org.elasticsearch.common.Strings;
@@ -33,7 +35,12 @@ import org.elasticsearch.repositories.RepositoryName;
 import org.elasticsearch.repositories.RepositorySettings;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 
+import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
+import java.security.*;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.Locale;
 
 /**
@@ -79,6 +86,49 @@ public class S3Repository extends BlobStoreRepository {
             throw new RepositoryException(name.name(), "No bucket defined for s3 gateway");
         }
 
+        String clientSideEncryptionSymmetricKeyBase64 = repositorySettings.settings().get(
+                "client_side_encryption_key.symmetric",
+                componentSettings.get("client_side_encryption_key.symmetric"));
+        String clientSideEncryptionPublicKeyBase64 = repositorySettings.settings().get(
+                "client_side_encryption_key.public",
+                componentSettings.get("client_side_encryption_key.public"));
+        String clientSideEncryptionPrivateKeyBase64 = repositorySettings.settings().get(
+                "client_side_encryption_key.private",
+                componentSettings.get("client_side_encryption_key.private"));
+        EncryptionMaterials clientSideEncryptionMaterials = null;
+        if (clientSideEncryptionSymmetricKeyBase64 != null && (clientSideEncryptionPublicKeyBase64 != null || clientSideEncryptionPrivateKeyBase64 != null)) {
+            throw new RepositoryException(name.name(), "Client-side encryption: You can't specify an symmetric key AND a public/private key pair");
+        }
+        if (clientSideEncryptionSymmetricKeyBase64 != null || clientSideEncryptionPublicKeyBase64 != null || clientSideEncryptionPrivateKeyBase64 != null) {
+            try {
+                // Check crypto
+                if (javax.crypto.Cipher.getMaxAllowedKeyLength("AES") < 256) {
+                    throw new RepositoryException(name.name(), "Client-side encryption: Please install the Java Cryptography Extension");
+                }
+
+                // Check Symmetric and Public/private exclusion
+                if (clientSideEncryptionSymmetricKeyBase64 != null && (clientSideEncryptionPublicKeyBase64 != null || clientSideEncryptionPrivateKeyBase64 != null)) {
+                    throw new RepositoryException(name.name(), "Client-side encryption: You can't specify an symmetric key AND a public/private key pair");
+                }
+
+                // Transform the keys in a EncryptionMaterials
+                if (clientSideEncryptionSymmetricKeyBase64 != null) {
+                    clientSideEncryptionMaterials = new EncryptionMaterials(new SecretKeySpec(Base64.decode(clientSideEncryptionSymmetricKeyBase64), "AES"));
+                } else {
+                    clientSideEncryptionMaterials = new EncryptionMaterials(new KeyPair(
+                            KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(Base64.decode(clientSideEncryptionPublicKeyBase64))),
+                            KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(Base64.decode(clientSideEncryptionPrivateKeyBase64)))));
+                }
+
+            } catch (IllegalArgumentException e) {
+                throw new RepositoryException(name.name(), "Client-side encryption: Error decoding your keys: " + e.getMessage());
+            } catch (NoSuchAlgorithmException e) {
+                throw new RepositoryException(name.name(), e.getMessage());
+            } catch (InvalidKeySpecException e) {
+                throw new RepositoryException(name.name(), e.getMessage());
+            }
+        }
+
         String endpoint = repositorySettings.settings().get("endpoint", componentSettings.get("endpoint"));
         String protocol = repositorySettings.settings().get("protocol", componentSettings.get("protocol"));
 
@@ -119,10 +169,27 @@ public class S3Repository extends BlobStoreRepository {
         this.chunkSize = repositorySettings.settings().getAsBytesSize("chunk_size", componentSettings.getAsBytesSize("chunk_size", new ByteSizeValue(100, ByteSizeUnit.MB)));
         this.compress = repositorySettings.settings().getAsBoolean("compress", componentSettings.getAsBoolean("compress", false));
 
-        logger.debug("using bucket [{}], region [{}], endpoint [{}], protocol [{}], chunk_size [{}], server_side_encryption [{}], buffer_size [{}], max_retries [{}]",
-                bucket, region, endpoint, protocol, chunkSize, serverSideEncryption, bufferSize, maxRetries);
+        logger.debug("using bucket [{}], region [{}], endpoint [{}], protocol [{}], chunk_size [{}], server_side_encryption [{}], buffer_size [{}], max_retries [{}], client_side_encryption [{}]",
+                bucket, region, endpoint, protocol, chunkSize, serverSideEncryption, bufferSize, maxRetries, clientSideEncryptionMaterials != null);
 
-        blobStore = new S3BlobStore(settings, s3Service.client(endpoint, protocol, region, repositorySettings.settings().get("access_key"), repositorySettings.settings().get("secret_key"), maxRetries), bucket, region, serverSideEncryption, bufferSize, maxRetries);
+        blobStore = new S3BlobStore(
+                settings,
+                s3Service.client(
+                        endpoint,
+                        protocol,
+                        region,
+                        repositorySettings.settings().get("access_key"),
+                        repositorySettings.settings().get("secret_key"),
+                        maxRetries,
+                        clientSideEncryptionMaterials
+                ),
+                bucket,
+                region,
+                serverSideEncryption,
+                bufferSize,
+                maxRetries
+        );
+
         String basePath = repositorySettings.settings().get("base_path", null);
         if (Strings.hasLength(basePath)) {
             BlobPath path = new BlobPath();
